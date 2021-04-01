@@ -1,0 +1,68 @@
+---
+title: "PLACEHOLDER TITLE"
+author:
+- name: Will Macnair
+  affiliation: 
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Switzerland
+  - Swiss Institute of Bioinformatics (SIB), University of Zurich, Switzerland
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Setup / definitions
+
+## Libraries
+
+```{r setup_knitr, include=FALSE}
+library('BiocStyle')
+knitr::opts_chunk$set( autodep=TRUE, cache=TRUE, cache.lazy=FALSE, dev='png' )
+knitr::opts_knit$set( root.dir='..' )
+# wflow_build(files='analysis/ms00_markdown_template.Rmd', view=F, verbose=T, delete_cache=F)
+```
+
+```{r setup_libs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+```
+
+## Helper functions
+
+```{r setup_helpers, message=FALSE, cache=FALSE}
+```
+
+## Inputs
+
+```{r setup_input}
+```
+
+## Outputs
+
+```{r setup_outputs}
+```
+
+# Load inputs
+
+```{r load_inputs}
+```
+
+# Processing / calculations
+
+```{r calc_calcs}
+```
+
+# Analysis
+
+```{r plot_plots, fig.height=8, fig.width=10}
+```
+
+# Outputs
+
+```{r save_outputs}
+```
+
+```{r session_info, include=TRUE, echo=TRUE, results='markup'}
+devtools::session_info()
+```

@@ -1,0 +1,489 @@
+---
+title: "Exploring the Spatial Mouse Atlas"
+author:
+- name: Elyas Heidari
+  affiliation: 
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Switzerland
+  - Swiss Institute of Bioinformatics (SIB), University of Zurich, Switzerland
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Setup / definitions
+
+## Libraries
+
+```{r setup_knitr, include=FALSE}
+library('BiocStyle')
+options(bitmapType='cairo')
+set.seed(1996)
+knitr::opts_chunk$set( autodep=TRUE, cache=FALSE, cache.lazy=FALSE, dev='png' )
+knitr::opts_knit$set( root.dir='..' )
+# wflow_build(files='analysis/sma01_eda.Rmd', view=F, verbose=T, delete_cache=T)
+```
+
+```{r setup_libs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+suppressMessages(source('code/scGCN/dep.R')) 
+```
+
+## Helper functions
+
+```{r setup_helpers, message=FALSE, cache=FALSE}
+source('code/sma00_utils.R')
+source('code/sma01_eda.R')
+```
+
+## Inputs
+
+```{r setup_input}
+exprs_f    = 'data/exprs.Rds'
+metadata_f = 'data/metadata.Rds'
+umap_f     = 'data/E8.5_joint_UMAP_df.Rds'
+nngraph_f  = 'data/E8.5_neighbourGraph_1.3.Rds'
+```
+
+## Outputs
+
+```{r setup_outputs}
+```
+
+# Load inputs
+
+```{r load_inputs}
+nngraph  = nngraph_f %>% readRDS 
+cells    = names(V(nngraph))
+exprs    = exprs_f %>% readRDS %>% 
+    as.matrix %>% .[, cells]  %>% t 
+metadata = metadata_f %>% readRDS %>% as.data.table %>%
+    setnames('uniqueID', 'cell') %>%
+    setkey('cell') %>%
+    .[cells] %>%
+    .[, embryo := paste(embryo, z, sep='_')]
+# umap     = umap_f %>% readRDS %>% as.data.table %>%
+#     setkey('cell') %>%
+#     .[cells] 
+embryos       = unique(metadata$embryo)
+cells_list   = embryos %>%
+    map(~unlist(metadata[embryo == .x, 'cell'])) %>%
+    setNames(embryos)
+nngraph_list = cells_list %>% 
+    map(~induced.subgraph(nngraph, .x))
+exprs_list   = cells_list %>% 
+    map(~exprs[.x, ])
+
+```
+
+# Processing / calculations
+
+## Spatial graph communities
+```{r spgraph_comm, message=FALSE, warning=FALSE, paged.print=FALSE}
+nncomm_list  = nngraph_list %>% 
+    map(nngraph_comm) %>%
+    setNames(NULL) %>%
+    unlist
+metadata$nncomm = paste(metadata$embryo, nncomm_list[metadata$cell], sep='_') 
+meta_list    = cells_list %>%
+    map(~metadata[cell %in% .x, ])
+```
+
+## GGM on everything
+
+```{r ggm_all_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graph_all = counts2graph(
+    mtx       = exprs,
+    rho       = 0.2,
+    threshold = 0.02,
+    no_hvg    = TRUE
+)
+act_all_types  = act_colors(graph_all$data, metadata$celltype_mapped_refined)
+act_all_comms  = act_colors(graph_all$data, metadata$nncomm)
+gc()
+```
+
+
+## GGM on embryo sections (robustness)
+```{r ggm_embryo_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs_embryo = list()
+ari_embryo    = list()
+for(t in unique(metadata$embryo)){
+    idx = which(metadata$embryo == t)
+    log_counts_type = graph_all$data[idx,] 
+    if(sum(colSds(log_counts_type) == 0) > 0)
+        log_counts_type %<>% .[, -which(colSds(.) == 0)]
+    log_counts_type %<>% as.data.table
+    ggm_obj = ggm(log_counts_type, rho=0.2, threshold=0.02)
+    gg = ggm_obj$graph
+    wi = ggm_obj$model$wi
+    isolated  = which(igraph::degree(gg) == 0)
+    gg = delete.vertices(gg, isolated)
+    wi %<>% .[-isolated, -isolated]
+    ggm_obj$graph    = gg
+    ggm_obj$model$wi = wi
+    graphs_embryo[[t]] = ggm_obj
+    comms  = leiden(abs(wi) > 0.02)
+    comm_dt  = copy(graph_all$comm_dt) %>% setkey('GENE')
+    ref_comm = comm_dt[names(V(gg))]$community
+    ari_embryo[[t]] = mclust::adjustedRandIndex(ref_comm, comms)
+}
+gc()
+```
+
+
+## GGM on cell types (robustness)
+```{r ggm_type_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs_type = list()
+ari_type    = list()
+for(t in levels(factor(metadata$celltype_mapped_refined, ordered=T))){
+    idx = which(metadata$celltype_mapped_refined == t)
+    if(length(idx) < 1000)
+        next
+    log_counts_type = graph_all$data[idx,] 
+    if(sum(colSds(log_counts_type) == 0) > 0)
+        log_counts_type %<>% .[, -which(colSds(.) == 0)]
+    log_counts_type %<>% as.data.table
+    ggm_obj = ggm(log_counts_type, rho=0.15, threshold=0.015)
+    gg = ggm_obj$graph
+    wi = ggm_obj$model$wi
+    isolated  = which(igraph::degree(gg) == 0)
+    gg = delete.vertices(gg, isolated)
+    wi %<>% .[-isolated, -isolated]
+    ggm_obj$graph    = gg
+    ggm_obj$model$wi = wi
+    graphs_type[[t]] = ggm_obj
+    comms  = leiden(abs(wi) > 0.015)
+    comm_dt  = copy(graph_all$comm_dt) %>% setkey('GENE')
+    ref_comm = comm_dt[names(V(gg))]$community
+    ari_type[[t]] = mclust::adjustedRandIndex(ref_comm, comms)
+}
+gc()
+```
+
+## GGM on spatial communities (robustness)
+```{r ggm_nncomm_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs_nncomm = list()
+ari_nncomm    = list()
+for(t in unique(metadata$nncomm)){
+    idx = which(metadata$nncomm == t)
+    if(length(idx) < 1000)
+        next
+    log_counts_type = graph_all$data[idx,] 
+    if(sum(colSds(log_counts_type) == 0) > 0)
+        log_counts_type %<>% .[, -which(colSds(.) == 0)]
+    log_counts_type %<>% as.data.table
+    ggm_obj = ggm(log_counts_type, rho=0.15, threshold=0.015)
+    gg = ggm_obj$graph
+    wi = ggm_obj$model$wi
+    isolated  = which(igraph::degree(gg) == 0)
+    gg = delete.vertices(gg, isolated)
+    wi %<>% .[-isolated, -isolated]
+    print(dim(wi))
+    ggm_obj$graph    = gg
+    ggm_obj$model$wi = wi
+    graphs_nncomm[[t]] = ggm_obj
+    comms  = leiden(abs(wi) > 0.015)
+    comm_dt  = copy(graph_all$comm_dt) %>% setkey('GENE')
+    ref_comm = comm_dt[names(V(gg))]$community
+    ari_nncomm[[t]] = mclust::adjustedRandIndex(ref_comm, comms)
+}
+gc()
+```
+
+## GGM on embryo sections (functional annotation)
+```{r ggm_embryo_full_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs            = list()
+act_embryo_type   = list()
+act_embryo_comm   = list()
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    print(t)
+    graphs[[t]] = counts2graph(
+        mtx       = exprs_list[[t]],
+        rho       = 0.2,
+        threshold = 0.02,
+        no_hvg    = TRUE
+    )
+    act_embryo_type[[t]] = act_colors(graphs[[t]]$data, meta_list[[t]]$celltype_mapped_refined)
+    act_embryo_comm[[t]] = act_colors(graphs[[t]]$data, meta_list[[t]]$nncomm) 
+}
+gc()
+```
+
+
+## GGM on embryo comms (functional annotation)
+```{r ggm_comm_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs            = list()
+act_embryo_type   = list()
+act_embryo_comm   = list()
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    print(t)
+    graphs[[t]] = counts2graph(
+        mtx       = exprs_list[[t]],
+        rho       = 0.2,
+        threshold = 0.02,
+        no_hvg    = TRUE
+    )
+    act_embryo_type[[t]] = act_colors(graphs[[t]]$data, meta_list[[t]]$celltype_mapped_refined)
+    act_embryo_comm[[t]] = act_colors(graphs[[t]]$data, meta_list[[t]]$nncomm) 
+}
+gc()
+```
+
+# Analysis
+
+## Spatial plots{.tabset}
+```{r sp_plots, fig.height=5, fig.width=12, results='asis', cache=FALSE}
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('### ', t, '\n')
+        type_p = plot_2d(
+            dim_df = meta_list[[t]][, .(x_global_affine, -y_global_affine)],
+            labels = meta_list[[t]]$celltype_mapped_refined,
+            label_cols = celltype_colours,
+            label_title  = 'Cell type'
+        )
+        comm_p = plot_2d(
+            dim_df = meta_list[[t]][, .(x_global_affine, -y_global_affine)],
+            labels = meta_list[[t]]$nncomm,
+            label_title = 'Spatial neighborhood'
+        )     
+        pl = (type_p + comm_p) + plot_layout(guides = 'collect')
+        print(pl)
+    cat('\n\n')
+
+}
+
+```
+
+## GGM on everything 
+```{r ggm_all_graph, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+graph_col_comm(
+    graph  = graph_all$graph, 
+    lay    = graph_all$lay, 
+    grp    = graph_all$comm_dt$color, 
+    sz     = 5, 
+    title  = 'GGM on everything', 
+    labels = graph_all$comm_dt$GENE
+)
+```
+
+
+### GGM on embryo sections (robustness){.tabset}
+```{r ggm_embryo_rob_graph, fig.height=11, fig.width=11, results='asis' , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+comm_dt = copy(graph_all$comm_dt) %>% setkey(GENE)
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('#### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_embryo[[t]]$graph, 
+            lay    = layout_nicely(graphs_embryo[[t]]$graph), 
+            grp    = comm_dt[names(V(graphs_embryo[[t]]$graph))]$color, 
+            sz     = 5, 
+            title  = sprintf('GGM on %s, ARI = %s', t, ari_embryo[[t]]), 
+            labels = comm_dt[names(V(graphs_embryo[[t]]$graph))]$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+### GGM on cell types (robustness){.tabset}
+```{r ggm_type_rob_graph, fig.height=11, fig.width=11, results='asis' , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+comm_dt = copy(graph_all$comm_dt) %>% setkey(GENE)
+for(t in levels(factor(names(graphs_type), ordered=TRUE))){
+    cat('#### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_type[[t]]$graph, 
+            lay    = layout_nicely(graphs_type[[t]]$graph), 
+            grp    = comm_dt[names(V(graphs_type[[t]]$graph))]$color, 
+            sz     = 5, 
+            title  = sprintf('GGM on %s, ARI = %s', t, ari_type[[t]]), 
+            labels = comm_dt[names(V(graphs_type[[t]]$graph))]$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+### GGM on spatial communities (robustness){.tabset}
+```{r ggm_nncomm_rob_graph, fig.height=11, fig.width=11, results='asis' , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+comm_dt = copy(graph_all$comm_dt) %>% setkey(GENE)
+for(t in levels(factor(names(graphs_nncomm), ordered=TRUE))){
+    cat('#### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_nncomm[[t]]$graph, 
+            lay    = layout_nicely(graphs_nncomm[[t]]$graph), 
+            grp    = comm_dt[names(V(graphs_nncomm[[t]]$graph))]$color, 
+            sz     = 5, 
+            title  = sprintf('GGM on %s', t), 
+            labels = comm_dt[names(V(graphs_nncomm[[t]]$graph))]$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+### Expression graphs{.tabset}
+
+#### On cell types{.tabset}
+```{r act_all_types, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in unique(metadata$celltype_mapped_refined)){
+    cat('##### ', t, '\n')
+        graph_col_act(graph_all$graph, act_all_types[t,], graph_all$lay, '')
+    cat('\n\n')
+}
+```
+
+#### On spatial graph communities {.tabset}
+```{r act_all_comms, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in unique(metadata$nncomm)){
+    cat('##### ', t, '\n')
+        graph_col_act(graph_all$graph, act_all_comms[t,], graph_all$lay, '')
+    cat('\n\n')
+}
+```
+
+### Expression heatmap{.tabset} 
+
+#### On cell types
+
+```{r hm_all_type, fig.height=25, fig.width=10, results='asis', cache=FALSE}
+col_dt = data.table(
+    ID    = rownames(act_all_types), 
+    group = rownames(act_all_types),
+    color = celltype_colours[rownames(act_all_types)]) %>%
+    setkey(ID)
+hm = hm_col_act(
+    mtx     = act_all_types, 
+    comm_dt = graph_all$comm_dt,
+    col_dt  = col_dt
+) 
+draw(hm)
+```
+
+#### On spatial graph communities
+```{r hm_all_comm, fig.height=25, fig.width=15, results='asis', cache=FALSE}
+col_dt = data.table(
+    ID    = rownames(act_all_comms), 
+    group = rownames(act_all_comms),
+    color = nice_cols[as.numeric(factor(rownames(act_all_comms), ordered=T))]) %>%
+    setkey(ID)
+hm = hm_col_act(
+    mtx     = act_all_comms, 
+    comm_dt = graph_all$comm_dt,
+    col_dt  = col_dt
+) 
+draw(hm)
+```
+
+
+## GGM on the embryo sections (functional annotation){.tabset}
+```{r ggm_embryo_graph, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='asis'}
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs[[t]]$graph, 
+            lay    = graphs[[t]]$lay, 
+            grp    = graphs[[t]]$comm_dt$color, 
+            sz     = 5, 
+            title  = 'GGM on %s', 
+            labels = graphs[[t]]$comm_dt$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+
+##
+
+
+### Expression graphs{.tabset}
+
+#### On cell types{.tabset}
+```{r act_embryo_type, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('##### ', t, '{.tabset}\n')
+        for (l in unique(meta_list[[t]]$celltype_mapped_refined)){
+            cat('###### ', l, '\n')
+                graph_col_act(graphs[[t]]$graph, act_embryo_type[[t]][l,], graphs[[t]]$lay, '')
+            cat('\n\n')
+        }
+    cat('\n\n')
+}
+```
+
+
+#### On spatial graph communities{.tabset}
+```{r act_embryo_comm, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('##### ', t, '{.tabset}\n')
+        for (l in unique(meta_list[[t]]$nncomm)){
+            cat('###### ', l, '\n')
+                graph_col_act(graphs[[t]]$graph, act_embryo_comm[[t]][l,], graphs[[t]]$lay, '')
+            cat('\n\n')
+        }
+    cat('\n\n')
+}
+```
+
+##
+
+### Expression heatmaps{.tabset}
+
+#### On cell types{.tabset}
+```{r hm_embryo_type, fig.height=25, fig.width=8, results='asis', cache=FALSE}
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('##### ', t, '\n')
+        col_dt = data.table(
+            ID    = rownames(act_embryo_type[[t]]), 
+            group = rownames(act_embryo_type[[t]]),
+            color = celltype_colours[rownames(act_embryo_type[[t]])]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx      = act_embryo_type[[t]], 
+            comm_dt  = graphs[[t]]$comm_dt,
+            col_dt   = col_dt
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+
+```
+
+#### On spatial graph communities{.tabset}
+```{r hm_embryo_comm, fig.height=25, fig.width=5, results='asis', cache=FALSE}
+for(t in levels(factor(metadata$embryo, ordered=TRUE))){
+    cat('##### ', t, '\n')
+        col_dt = data.table(
+            ID    = rownames(act_embryo_comm[[t]]), 
+            group = rownames(act_embryo_comm[[t]]),
+            color = nice_cols[as.numeric(factor(rownames(act_embryo_comm[[t]]), ordered=T))]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx      = act_embryo_comm[[t]], 
+            comm_dt  = graphs[[t]]$comm_dt,
+            col_dt   = col_dt,
+            cluster_columns=TRUE
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+```
+
+
+# Outputs
+
+```{r save_outputs}
+```
+
+```{r session_info, include=TRUE, echo=TRUE, results='markup'}
+devtools::session_info()
+```

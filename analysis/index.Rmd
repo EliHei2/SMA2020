@@ -1,5 +1,5 @@
 ---
-title: "Home"
+title: "MS lesions project index file"
 site: workflowr::wflow_site
 output:
   workflowr::wflow_html:
@@ -8,4 +8,15 @@ editor_options:
   chunk_output_type: console
 ---
 
-Welcome to my research website.
+<!-- wflow_build(files='analysis/index.Rmd', view=F, verbose=T, delete_cache=F) -->
+
+# Overview
+
+- [Make `SingleCellExperiment` object](ms01_make_sce.html)
+- [Exclude doublets via `scDblFinder`](ms02_doublet_id.html)
+- [QC via `SampleQC`](ms03_SampleQC.html)
+- [Batch correction via `conos`](ms04_conos.html)
+- [Checking and subdividing clusters](ms05_splitting.html)
+- [Merging clusters via `SCCAF`](ms06_sccaf.html)
+- [Differential abundance via `ANCOM-BC`](ms07_ancombc.html)
+

@@ -1,0 +1,15 @@
+Detect robust functional/marker gene modules
+Cell-type / condition specific markers
+Metagenes  modular embedding (space)
+Like popAlign
+Capture perturbed gene dependency structures
+Which associations are perturbed in response to disease/treatment
+Detect cell-type specific gene regulatory programs 
+(de-)Active pathways during cell differentiation
+Simulating single cell data
+More accurate simulations (SERGIO like)
+Possible to inject batch-effects (if robust!)
+Gene regulatory network inference
+Maybe by injecting RNA velocity?
+
+
