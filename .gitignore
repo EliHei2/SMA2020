@@ -6,6 +6,7 @@
 .DS_Store
 data
 docs
+output
 analysis/figure
 analysis/*png
 analysis/*html

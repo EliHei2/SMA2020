@@ -1,0 +1,744 @@
+---
+title: "Glasso"
+author:
+- name: Elyas Heidari
+  affiliation: 
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Switzerland
+  - Swiss Institute of Bioinformatics (SIB), University of Zurich, Switzerland
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Setup / definitions
+
+## Libraries
+
+```{r setup_knitr, include=FALSE}
+library('BiocStyle')
+options(bitmapType='cairo')
+knitr::opts_chunk$set(autodep=TRUE, cache=FALSE, dev='png', cache.lazy = FALSE)
+knitr::opts_knit$set( root.dir='..' )
+set.seed(1996)
+# wflow_build(files='analysis/ms10_glasso_vignette.Rmd', view=F, verbose=T, delete_cache=T)
+```
+
+## Helper functions
+```{r setup_libs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+suppressMessages(source('code/scGCN/dep.R')) 
+source('code/ms00_utils.R')
+source('code/ms10_glasso.R')
+```
+
+## Inputs
+```{r setup_input, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+# results files
+base_dir = '/home/Shared_taupo/will/projects/MS_lesions'
+sce_f    = file.path(base_dir, 'data/sce_raw/ms_sce.rds')
+conos_f = file.path(base_dir, 'output/ms06_sccaf/conos_merged_dt_2021-03-18.csv')
+meta_f   = file.path(base_dir, 'data/metadata/metadata_updated_20201127.txt')
+pb_f     = file.path('.', 'output/ms09_muscat/sce_pb_broad_2021-03-23.rds')
+```
+
+
+## Outputs
+```{r setup_outputs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+# output paths
+time_stamp = format(Sys.Date(), '%Y_%m_%d')
+out_dir    = 'output/ms10_glasso'
+dir.create(out_dir)
+## parameters
+set.seed(1996)
+cluster_var = 'conos_merge'
+prop_train  = .5
+max_cells   = 10000
+min_genes   = 1000
+min_counts  = 100
+rho         = 0.5
+n_hvgs_all  = 1000
+n_hvgs_comb = 500
+n_hvgs_type = 500
+# dirs
+### output
+graph_com_f = file.path(out_dir, sprintf('%s/graph_comm_%s_%s.pdf', '%s', '%s', time_stamp))
+graph_act_f = file.path(out_dir, sprintf('%s/graph_act_%s_%s.png', '%s', '%s', time_stamp))
+```
+
+## Load data and preprocess
+```{r load_data, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+# load data
+## conos clusters + sub-sampling
+conos_dt = read.csv(conos_f) %>% 
+    as.data.table 
+broad_freqs = rowSums(table(conos_dt$type_broad, conos_dt$conos_merge) > 0)
+conos_dt$broad_freq = broad_freqs[conos_dt$type_broad]
+
+## sce object
+sce      = readRDS(sce_f) %>% .[, conos_dt$cell_id]
+col_dt = as.data.table(colData(sce), keep.rownames = TRUE) %>% 
+    setnames('rn', 'cell_id') 
+sex_bal = min(table(col_dt$sex))
+col_dt %<>% 
+    .[, .SD[sample(.N, min(.N, ..sex_bal), replace=FALSE)], by=sex]
+conos_dt %<>% .[col_dt, on='cell_id'] %>%
+    .[, condition  := ifelse(lesion_type == 'GM' | lesion_type == 'WM', 'CTR', 'MS')] %>%
+    .[, lesion_type:= factor(lesion_type, ordered=TRUE, levels=lesion_ord)] %>%
+    .[, type_broad := factor(type_broad, ordered=TRUE, levels=broad_ord)] %>%
+    .[, conos_merge:= factor(conos_merge)] %>%
+    .[, subset_size := ..max_cells %/% unique(broad_freq), by=cluster_var] %>%
+    .[, .SD[sample(.N, min(.N, subset_size), replace=FALSE)], by=cluster_var]
+sce  %<>%  .[,conos_dt$cell_id] %>%
+    .[rowSums(counts(.)) > min_counts, ]
+rowData(sce)$symbol = strsplit2(rownames(sce),split='_')[,1]
+sce %<>% .[-which((rowData(.)$symbol %in% ex_genes | grepl('^MT', rowData(.)$symbol))),]
+log_counts  = logNormCounts(sce) %>% logcounts 
+
+## psudo-bulk object
+# pb      = readRDS(pb_f)
+# assays(pb)[['soup']] = NULL
+# pb_meta = colData(pb) %>%
+#     as.data.table %>%
+#     setnames('group_id', 'lesion_type') %>%
+#     .[, lesion_type:= factor(lesion_type, ordered=TRUE, levels=lesion_ord)] %>%
+#     .[, disease_status := factor(disease_status, ordered=TRUE, levels=disease_ord)] 
+# rownames(pb)   = strsplit2(rownames(pb),split='_')[,1]
+# # assayNames(pb) = str_replace(assayNames(pb), '/', '--')
+# pb_counts = assays(pb) %>% 
+#     as.list %>%
+#     map(function(x) x[, colSums(x) > 0]) %>%
+#     map(~(edgeR::cpm(.x) + 1)) %>% 
+#     map(log10)
+# pb_counts_all = assays(pb) %>% purrr::reduce(`+`) %>% edgeR::cpm(.) %>% `+`(1) %>% log10
+gc()
+```
+
+#  Preprocessing / calculations
+
+## GGM on everything
+
+```{r ggm_all_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graph_all = counts2graph(
+    mtx = log_counts,
+    rho = 0.4,
+    threshold = 0.04,
+    n_hvgs = n_hvgs_all
+)
+act_all_broad  = act_colors(graph_all$data, conos_dt$type_broad)
+act_all_lesion = act_colors(graph_all$data, conos_dt$lesion_type) %>%
+    .[levels(conos_dt$lesion_type), ]
+gc()
+```
+
+## Normal correlation on everything
+
+```{r corr_all_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graph_corr_0.3 = counts2graph(
+    mtx = log_counts,
+    rho = 0.4,
+    threshold = 0.04,
+    cut_off   = 0.3,
+    n_hvgs = n_hvgs_all,
+    corr   = TRUE
+)
+
+graph_corr_0.7 = counts2graph(
+    mtx = log_counts,
+    rho = 0.4,
+    threshold = 0.04,
+    cut_off   = 0.7,
+    n_hvgs = n_hvgs_all,
+    corr   = TRUE
+)
+gc()
+```
+
+## GGM on lesion types (robustness)
+```{r ggm_lesion_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs_lesion = list()
+ari_lesion    = list()
+for(t in levels(conos_dt$lesion_type)){
+    idx = which(conos_dt$lesion_type == t)
+    log_counts_type = graph_all$data[idx,] 
+    if(sum(colSds(log_counts_type) == 0) > 0)
+        log_counts_type %<>% .[, -which(colSds(.) == 0)]
+    log_counts_type %<>% as.data.table
+    ggm_obj = ggm(log_counts_type, rho=0.4, threshold=0.04)
+    gg = ggm_obj$graph
+    wi = ggm_obj$model$wi
+    isolated  = which(igraph::degree(gg) == 0)
+    gg = delete.vertices(gg, isolated)
+    wi %<>% .[-isolated, -isolated]
+    ggm_obj$graph    = gg
+    ggm_obj$model$wi = wi
+    graphs_lesion[[t]] = ggm_obj
+    comms  = leiden(abs(wi) > 0.04)
+    comm_dt  = copy(graph_all$comm_dt) %>% setkey('GENE')
+    ref_comm = comm_dt[names(V(gg))]$community
+    ari_lesion[[t]] = mclust::adjustedRandIndex(ref_comm, comms)
+}
+gc()
+```
+
+## GGM on broad types (robustness)
+```{r ggm_broad_rob_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs_broad_rob = list()
+ari_broad_rob    = list()
+for(t in levels(conos_dt$type_broad)){
+    idx = which(conos_dt$type_broad == t)
+    log_counts_type = graph_all$data[idx,] 
+    if(sum(colSds(log_counts_type) == 0) > 0)
+        log_counts_type %<>% .[, -which(colSds(.) == 0)]
+    log_counts_type %<>% as.data.table
+    ggm_obj = ggm(log_counts_type, rho=0.4, threshold=0.04)
+    gg = ggm_obj$graph
+    wi = ggm_obj$model$wi
+    isolated  = which(igraph::degree(gg) == 0)
+    gg = delete.vertices(gg, isolated)
+    wi %<>% .[-isolated, -isolated]
+    ggm_obj$graph    = gg
+    ggm_obj$model$wi = wi
+    graphs_broad_rob[[t]] = ggm_obj
+    comms    = leiden(abs(wi) > 0.04)
+    comm_dt  = copy(graph_all$comm_dt) %>% setkey('GENE')
+    ref_comm = comm_dt[names(V(gg))]$community
+    ari_broad_rob[[t]] = mclust::adjustedRandIndex(ref_comm, comms)
+}
+gc()
+```
+
+## GGM on broad types (functional annotation)
+```{r ggm_broad_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs           = list()
+act_broad_fine   = list()
+act_broad_lesion = list()
+for(t in levels(conos_dt$type_broad)){
+    idx = which(conos_dt$type_broad == t)
+    log_counts_type = log_counts[,idx]
+    graphs[[t]] = counts2graph(
+        mtx       = log_counts_type,
+        rho       = 0.25,
+        threshold = 0.025,
+        n_hvgs    = n_hvgs_type
+    )
+    act_broad_fine[[t]]   = act_colors(graphs[[t]]$data, droplevels(conos_dt[idx,]$conos_merge))
+    act_broad_lesion[[t]] = act_colors(graphs[[t]]$data, droplevels(conos_dt[idx,]$lesion_type)) %>%
+        .[levels(conos_dt[idx,]$lesion_type), ]
+}
+gc()
+```
+
+## GGM on combined broad types (functional annotation)
+```{r ggm_combined_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+comb_types      = list(
+    micro_immune = c('Microglia', 'Immune'),
+    endo_peri    = c('Endothelial cells', 'Pericytes'),
+    oligo_opc    = c('Oligodendrocytes', 'OPCs / COPs'))
+graphs_comb     = list()
+act_comb_fine   = list()
+act_comb_lesion = list()
+for(t in names(comb_types)){
+    print(t)
+    l = comb_types[[t]]
+    idx = which(conos_dt$type_broad %in% l)
+    log_counts_type = log_counts[,idx]
+    graphs_comb[[t]] = counts2graph(
+        mtx       = log_counts_type,
+        rho       = 0.3,
+        threshold = 0.03,
+        n_hvgs    = n_hvgs_comb
+    )
+    act_comb_fine[[t]]   = act_colors(graphs_comb[[t]]$data, droplevels(conos_dt[idx,]$conos_merge))
+    act_comb_lesion[[t]] = act_colors(graphs_comb[[t]]$data, droplevels(conos_dt[idx,]$lesion_type)) %>%
+        .[levels(conos_dt[idx,]$lesion_type), ]
+}
+gc()
+```
+
+## Sample projections
+```{r samples_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide', eval=FALSE}
+#TODO: optimize rho and threshold
+# TODO: all graph
+# type broad graphs
+samples_trans = list()
+for(t in levels(conos_dt$type_broad)){
+    trans = graphs[[t]]$trans
+    data_sample = t(pb_counts[[t]][rownames(trans),])
+    samples_trans[[t]] = data_sample %*% trans
+}
+gc()
+```
+
+# Analysis
+
+## Corralation on everything 
+```{r cor_all_graph_3, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+graph_col_comm(
+    graph  = graph_corr_0.3$graph, 
+    lay    = graph_corr_0.3$lay, 
+    grp    = graph_corr_0.3$comm_dt$color, 
+    sz     = 5, 
+    title  = 'Correlation on everything, cut off = 0.3', 
+    labels = graph_corr_0.3$comm_dt$GENE
+)
+
+graph_col_comm(
+    graph  = graph_corr_0.7$graph, 
+    lay    = graph_corr_0.7$lay, 
+    grp    = graph_corr_0.7$comm_dt$color, 
+    sz     = 5, 
+    title  = 'Correlation on everything, cut off = 0.7', 
+    labels = graph_corr_0.7$comm_dt$GENE
+)
+```
+
+## GGM on everything 
+```{r ggm_all_graph, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+graph_col_comm(
+    graph  = graph_all$graph, 
+    lay    = graph_all$lay, 
+    grp    = graph_all$comm_dt$color, 
+    sz     = 5, 
+    title  = 'GGM on everything', 
+    labels = graph_all$comm_dt$GENE
+)
+```
+
+##
+
+### GGM on lesion types (robustness){.tabset}
+```{r ggm_lesion_graph, fig.height=11, fig.width=11, results='asis' , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+comm_dt = copy(graph_all$comm_dt) %>% setkey(GENE)
+for(t in levels(conos_dt$lesion_type)){
+    cat('#### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_lesion[[t]]$graph, 
+            lay    = layout_nicely(graphs_lesion[[t]]$graph), 
+            grp    = comm_dt[names(V(graphs_lesion[[t]]$graph))]$color, 
+            sz     = 5, 
+            title  = sprintf('GGM on %s, ARI = %s', t, ari_lesion[[t]]), 
+            labels = comm_dt[names(V(graphs_lesion[[t]]$graph))]$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+##
+
+### GGM on broad types (robustness){.tabset}
+```{r ggm_broad_rob_graph, fig.height=11, fig.width=11, results='asis' , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+comm_dt = copy(graph_all$comm_dt) %>% setkey(GENE)
+for(t in levels(conos_dt$type_broad)){
+    cat('#### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_broad_rob[[t]]$graph, 
+            lay    = layout_nicely(graphs_broad_rob[[t]]$graph), 
+            grp    = comm_dt[names(V(graphs_broad_rob[[t]]$graph))]$color, 
+            sz     = 5, 
+            title  = sprintf('GGM on %s, ARI = %s', t, ari_broad_rob[[t]]), 
+            labels = comm_dt[names(V(graphs_broad_rob[[t]]$graph))]$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+### Expression graphs{.tabset}
+
+#### Broad cell types{.tabset}
+```{r act_all_broad, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in levels(conos_dt$type_broad)){
+    cat('##### ', t, '\n')
+        graph_col_act(graph_all$graph, act_all_broad[t,], graph_all$lay, '')
+    cat('\n\n')
+}
+```
+
+#### Lesion types{.tabset}
+```{r act_all_lesion, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in levels(conos_dt$lesion_type)){
+    cat('##### ', t, '\n')
+        graph_col_act(graph_all$graph, act_all_lesion[t,], graph_all$lay, '')
+    cat('\n\n')
+}
+```
+
+### Expression heatmaps{.tabset}
+
+#### Broad cell types
+```{r hm_all_broad, fig.height=35, fig.width=5, results='asis', cache=FALSE}
+col_dt = data.table(
+    ID    = rownames(act_all_broad), 
+    group = rownames(act_all_broad),
+    color = broad_cols[rownames(act_all_broad)]) %>%
+    setkey(ID)
+hm = hm_col_act(
+    mtx     = act_all_broad, 
+    comm_dt = graph_all$comm_dt,
+    col_dt  = col_dt
+) 
+draw(hm)
+```
+
+#### Lesion types
+```{r hm_all_lesion, fig.height=35, fig.width=5, results='asis', cache=FALSE}
+col_dt = data.table(
+    ID    = rownames(act_all_lesion), 
+    group = rownames(act_all_lesion),
+    color = lesion_cols[rownames(act_all_lesion)]) %>%
+    setkey(ID)
+hm = hm_col_act(
+    mtx     = act_all_lesion, 
+    comm_dt = graph_all$comm_dt,
+    col_dt  = col_dt,
+    cluster_columns=FALSE
+) 
+draw(hm)
+```
+
+#### Samples
+```{r hm_all_samples, fig.height=35, fig.width=30, results='asis', cache=FALSE, eval=FALSE}
+act_all_samples = act_colors(t(pb_counts_all[graph_all$comm_dt$GENE,]), colnames(pb))
+col_dt = data.table(
+    ID    = rownames(t(pb_counts_all)), 
+    group = colData(pb)$group_id,
+    color = lesion_cols[colData(pb)$group_id]) %>%
+    setkey(ID)
+hm = hm_col_act(
+    mtx     = act_all_samples, 
+    comm_dt = graph_all$comm_dt,
+    col_dt  = col_dt
+) 
+draw(hm)
+```
+
+### UMAP embeddings
+```{r redim_all, fig.height=7, fig.width=7, message=FALSE, warning=FALSE, paged.print=FALSE, cache=FALSE, eval=FALSE}
+# calced 
+data_norm    = graph_all$data
+data_trans   = graph_all$data_trans
+cell_types   = conos_dt$type_broad
+lesion_types = conos_dt$lesion_type
+# umap calcs
+umap_norm  = uwot::umap(data_norm)
+umap_trans = uwot::umap(data_trans) 
+umap_markers = uwot::umap(data_norm[,unique(graph_all$comm_dt$marker)])
+# plots
+pl_type   = plot_umap(umap_norm, cell_types, label_cols=broad_cols, title='All genes')
+pl_lesion = plot_umap(umap_norm, lesion_types, label_cols=lesion_cols, title='')
+lp_type   = plot_umap(umap_trans, cell_types, label_cols=broad_cols, title='Projected')
+lp_lesion = plot_umap(umap_trans, lesion_types, label_cols=lesion_cols, title='')
+lm_type   = plot_umap(umap_markers, cell_types, label_cols=broad_cols, title='Marker genes')
+lm_lesion = plot_umap(umap_markers, lesion_types, label_cols=lesion_cols, title='')
+(pl_type + pl_lesion + lp_type + lp_lesion + lm_type + lm_lesion) +
+    plot_layout(guides = 'collect', nrow=3)
+```
+
+## GGM on the broad types{.tabset}
+```{r ggm_broad_graph, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='asis'}
+for(t in levels(conos_dt$type_broad)){
+    cat('### ', t, '\n')
+        gg = graph_col_comm(
+
+            graph  = graphs[[t]]$graph, 
+            lay    = graphs[[t]]$lay, 
+            grp    = graphs[[t]]$comm_dt$color, 
+            sz     = 5, 
+            title  = 'GGM on %s', 
+            labels = graphs[[t]]$comm_dt$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+
+##
+
+
+### Expression graphs{.tabset}
+
+#### Fine cell types{.tabset}
+```{r act_broad_fine, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in levels(conos_dt$type_broad)){
+    cat('##### ', t, '{.tabset}\n')
+        for (l in unique(conos_dt[type_broad==t]$conos_merge)){
+            cat('###### ', l, '\n')
+                graph_col_act(graphs[[t]]$graph, act_broad_fine[[t]][l,], graphs[[t]]$lay, '')
+            cat('\n\n')
+        }
+    cat('\n\n')
+}
+```
+
+
+#### Lesion types{.tabset}
+```{r act_broad_lesion, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in levels(conos_dt$type_broad)){
+    cat('##### ', t, '{.tabset}\n')
+        for (l in levels(conos_dt[type_broad==t]$lesion_type)){
+            cat('###### ', l, '\n')
+                graph_col_act(graphs[[t]]$graph, act_broad_lesion[[t]][l,], graphs[[t]]$lay, '')
+            cat('\n\n')
+        }
+    cat('\n\n')
+}
+```
+
+##
+
+### Expression heatmaps{.tabset}
+
+#### Fine cell types{.tabset}
+```{r hm_broad_fine, fig.height=25, fig.width=5, results='asis', cache=FALSE}
+for(t in levels(conos_dt$type_broad)){
+    cat('##### ', t, '\n')
+        col_dt = data.table(
+            ID    = rownames(act_broad_fine[[t]]), 
+            group = rownames(act_broad_fine[[t]]),
+            color = nice_cols[1:dim(act_broad_fine[[t]])[1]]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx      = act_broad_fine[[t]], 
+            comm_dt  = graphs[[t]]$comm_dt,
+            col_dt   = col_dt
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+
+```
+
+#### Lesion types{.tabset}
+```{r hm_broad_lesion, fig.height=25, fig.width=5, results='asis', cache=FALSE}
+for(t in levels(conos_dt$type_broad)){
+    cat('##### ', t, '\n')
+        col_dt = data.table(
+            ID    = rownames(act_broad_lesion[[t]]), 
+            group = rownames(act_broad_lesion[[t]]),
+            color = lesion_cols[rownames(act_broad_lesion[[t]])]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx      = act_broad_lesion[[t]], 
+            comm_dt  = graphs[[t]]$comm_dt,
+            col_dt   = col_dt,
+            cluster_columns=FALSE
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+```
+
+#### Samples{.tabset}
+```{r hm_broad_samples, fig.height=25, fig.width=20, results='asis', cache=FALSE, eval=FALSE}
+for(t in levels(conos_dt$type_broad)){
+    cat('##### ', t, '\n')
+        act_samples = act_colors(t(pb_counts[[t]][graphs[[t]]$comm_dt$GENE,]), colnames(pb_counts[[t]]))
+        col_dt = data.table(
+            ID    = rownames(t(pb_counts[[t]])), 
+            group = colData(pb[, rownames(t(pb_counts[[t]]))])$group_id,
+            color = lesion_cols[colData(pb[, rownames(t(pb_counts[[t]]))])$group_id]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx     = act_samples, 
+            comm_dt = graphs[[t]]$comm_dt,
+            col_dt  = col_dt
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+```
+
+
+
+## GGM on the combined types{.tabset}
+```{r ggm_comb_graph, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='asis'}
+for(t in names(comb_types)){
+    cat('### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_comb[[t]]$graph, 
+            lay    = graphs_comb[[t]]$lay, 
+            grp    = graphs_comb[[t]]$comm_dt$color, 
+            sz     = 5, 
+            title  = 'GGM on everything', 
+            labels = graphs_comb[[t]]$comm_dt$GENE
+        )
+    cat('\n\n')
+
+}
+```
+
+
+##
+
+
+### Expression graphs{.tabset}
+
+#### Fine cell types{.tabset}
+```{r act_comb_fine, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in names(comb_types)){
+    types = comb_types[[t]]
+    cat('##### ', t, '{.tabset}\n')
+        for (l in unique(conos_dt[type_broad %in% types]$conos_merge)){
+            cat('###### ', l, '\n')
+                graph_col_act(graphs_comb[[t]]$graph, act_comb_fine[[t]][l,], graphs_comb[[t]]$lay, '')
+            cat('\n\n')
+        }
+    cat('\n\n')
+}
+```
+
+
+#### Lesion types{.tabset}
+```{r act_comb_lesion, fig.height=5, fig.width=5, results='asis', cache=FALSE}
+for (t in names(comb_types)){
+    types = comb_types[[t]]
+    cat('##### ', t, '{.tabset}\n')
+        for (l in levels(conos_dt[type_broad %in% types]$lesion_type)){
+            cat('###### ', l, '\n')
+                graph_col_act(graphs_comb[[t]]$graph, act_comb_lesion[[t]][l,], graphs_comb[[t]]$lay, '')
+            cat('\n\n')
+        }
+    cat('\n\n')
+}
+```
+
+##
+
+### Expression heatmaps{.tabset}
+
+#### Fine cell types{.tabset}
+```{r hm_comb_fine, fig.height=25, fig.width=5, results='asis', cache=FALSE}
+for(t in names(comb_types)){
+    cat('##### ', t, '\n')
+        col_dt = data.table(
+            ID    = rownames(act_comb_fine[[t]]), 
+            group = rownames(act_comb_fine[[t]]),
+            color = nice_cols[1:dim(act_comb_fine[[t]])[1]]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx      = act_comb_fine[[t]], 
+            comm_dt  = graphs_comb[[t]]$comm_dt,
+            col_dt   = col_dt
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+
+```
+
+#### Lesion types{.tabset}
+```{r hm_comb_lesion, fig.height=25, fig.width=5, results='asis', cache=FALSE}
+for(t in names(comb_types)){
+    cat('##### ', t, '\n')
+        col_dt = data.table(
+            ID    = rownames(act_comb_lesion[[t]]), 
+            group = rownames(act_comb_lesion[[t]]),
+            color = lesion_cols[rownames(act_comb_lesion[[t]])]) %>%
+            setkey(ID)
+        hm = hm_col_act(
+            mtx      = act_comb_lesion[[t]], 
+            comm_dt  = graphs_comb[[t]]$comm_dt,
+            col_dt   = col_dt,
+            cluster_columns=FALSE
+        ) 
+        draw(hm)
+    cat('\n\n')
+}
+```
+
+
+
+##
+
+### UMAP embeddings{.tabset}
+```{r redim_broad, fig.height=5, fig.width=7, message=FALSE, warning=FALSE, paged.print=FALSE, cache=FALSE, results='asis', eval=FALSE}
+for(t in levels(conos_dt$type_broad)){
+    cat('#### ', t, '\n')
+        # calced 
+        data_norm    = graphs[[t]]$data
+        data_trans   = graphs[[t]]$data_trans
+        cell_types   = conos_dt[type_broad==t]$conos_merge
+        lesion_types = conos_dt[type_broad==t]$lesion_type
+        # umap calcs
+        umap_norm  = uwot::umap(data_norm)
+        umap_trans = uwot::umap(data_trans)  
+        umap_markers = uwot::umap(data_norm[,unique(graphs[[t]]$comm_dt$marker)])
+        # plots
+        pl_type   = plot_umap(umap_norm, cell_types, title='All genes')
+        pl_lesion = plot_umap(umap_norm, lesion_types, label_cols=lesion_cols, title='')
+        lp_type   = plot_umap(umap_trans, cell_types, title='Projected')
+        lp_lesion = plot_umap(umap_trans, lesion_types, label_cols=lesion_cols, title='')
+        lm_type   = plot_umap(umap_markers, cell_types, title='Marker genes')
+        lm_lesion = plot_umap(umap_markers, lesion_types, label_cols=lesion_cols, title='')
+        pl = (pl_type + pl_lesion + lp_type + lp_lesion + lm_type + lm_lesion) +
+            plot_layout(guides = 'collect', nrow=3)
+        print(pl)
+    cat('\n\n')
+}
+```
+
+## Sample distances based on the psudo-bulk object{.tabset}
+```{r redim_samples, fig.height=5, fig.width=7, message=FALSE, warning=FALSE, paged.print=FALSE, cache=FALSE, results='asis', eval=FALSE}
+data_norm = list()
+data_trans = list()
+lesion_types = pb_meta$lesion_type
+status_types = pb_meta$disease_status
+for(t in levels(conos_dt$type_broad)){
+    cat('### ', t, '\n')
+        # calced 
+        data_norm[[t]]    = t(pb_counts[[t]][rownames(graphs[[t]]$trans), ])
+        data_trans[[t]]   = samples_trans[[t]]
+        # umap calcs
+        umap_norm  = uwot::umap(data_norm[[t]])
+        umap_trans = uwot::umap(data_trans[[t]])  
+        umap_markers = uwot::umap(data_norm[[t]][,unique(graphs[[t]]$comm_dt$marker)])
+        # plots
+        pl_lesion = plot_umap(umap_norm, lesion_types, label_cols=lesion_cols, title='All genes')
+        pl_status = plot_umap(umap_norm, status_types, label_cols=disease_cols, title='')
+        lp_lesion = plot_umap(umap_trans, lesion_types, label_cols=lesion_cols, title='Projected')
+        lp_status = plot_umap(umap_trans, status_types, label_cols=disease_cols, title='')
+        lm_lesion = plot_umap(umap_markers, lesion_types, label_cols=lesion_cols, title='Marker genes')
+        lm_status = plot_umap(umap_markers, status_types, label_cols=disease_cols, title='')
+        pl = (pl_type + pl_lesion + lp_type + lp_lesion + lm_lesion + lm_status) +
+            plot_layout(guides = 'collect', nrow=3)
+        print(pl)
+    cat('\n\n')
+}
+```
+##
+
+### Integration
+```{r redim_int, fig.height=5, fig.width=7, message=FALSE, warning=FALSE, paged.print=FALSE, cache=FALSE, results='asis', eval=FALSE}
+data_norm  = data_norm %>% purrr::reduce(cbind)
+data_trans = data_trans %>% purrr::reduce(cbind)
+umap_norm  = uwot::umap(data_norm)
+umap_trans = uwot::umap(data_trans) 
+umap_markers = uwot::umap(data_norm[,unique(graphs[[t]]$comm_dt$marker)]) 
+# plots
+pl_lesion = plot_umap(umap_norm, lesion_types, label_cols=lesion_cols, title='All genes')
+pl_status = plot_umap(umap_norm, status_types, label_cols=disease_cols, title='')
+lp_lesion = plot_umap(umap_trans, lesion_types, label_cols=lesion_cols, title='Projected')
+lp_status = plot_umap(umap_trans, status_types, label_cols=disease_cols, title='')
+lm_lesion = plot_umap(umap_markers, lesion_types, label_cols=lesion_cols, title='Marker genes')
+lm_status = plot_umap(umap_markers, status_types, label_cols=disease_cols, title='')
+pl = (pl_type + pl_lesion + lp_type + lp_lesion + lm_lesion + lm_status) +
+    plot_layout(guides = 'collect', nrow=3)
+print(pl)
+```
+
+
+# Session info
+```{r sess, message=FALSE, warning=FALSE, paged.print=FALSE}
+sessionInfo()
+```
