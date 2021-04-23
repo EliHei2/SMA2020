@@ -1,0 +1,103 @@
+---
+title: "Differential state analysis with `muscat`"
+author:
+- name: Helena L Crowell
+  affiliation:
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Zurich, Switzerland
+  - &SIB Swiss Institute of Bioinformatics (SIB), Zurich, Switzerland
+  email: helena.crowell@uzh.ch
+- name: Charlotte Soneson
+  affiliation:
+  - *IMLS
+  - 'Present address: Friedrich Miescher Institute Basel, Switzerland <br> & Swiss Institute of Bioinformatics (SIB), Basel, Switzerland'
+- name: Pierre-Luc Germain
+  affiliation:
+  - *IMLS
+  - *SIB
+- name: Mark D Robinson
+  affiliation:
+  - *IMLS
+  - *SIB
+package: "`r BiocStyle::pkg_ver('muscat')`"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: 
+  BiocStyle::html_document
+vignette: >
+  %\VignetteIndexEntry{"1. DS analysis"}
+  %\VignettePackage{muscat}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+bibliography: "`r file.path(system.file('extdata', package = 'muscat'), 'refs.bib')`"
+abstract: > 
+  <p> Single-cell RNA sequencing (scRNA-seq) has quickly become an empowering technology to profile the transcriptomes of individual cells on a large scale. Many early analyses of differential expression have aimed at identifying differences between subpopulations, and thus are focused on finding subpopulation markers either in a single sample or across multiple samples. More generally, such methods can compare expression levels in multiple sets of cells, thus leading to cross-condition analyses.
+  <p> However, given the emergence of replicated multi-condition scRNA-seq  datasets,  an  area  of  increasing  focus  is making  sample-level inferences, termed here as *differential state* (DS) analysis. For example, one could investigate the condition-specific responses of cell subpopulations measured from patients in each condition.
+  <p> `muscat`: **mu**lti-sample **mu**lti-group **sc**RNA-seq **a**nalysis **t**ools [@Crowell2019-muscat] provides various methods and visualization tools for DS analysis in multi-sample, multi-group, multi-(cell-)subpopulation scRNA-seq data, including cell-level mixed models and methods based on aggregated “pseudobulk” data, as well as a flexible simulation platform that mimics both single and multi-sample scRNA-seq data.
+---
+
+<style type="text/css">
+.smaller {
+  font-size: 10px
+}
+</style>
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+library(BiocStyle)
+library(cowplot)
+```
+
+
+For details on the concept and technicalities of DS analysis, and the methods presented here, consider having a look at our preprint:
+
+> Crowell HL, Soneson C\*, Germain P-L\*,  
+Calini D, Collin L, Raposo C, Malhotra D & Robinson MD:  
+On the discovery of population-specific state transitions from  
+multi-sample multi-condition single-cell RNA sequencing data.  
+*bioRxiv* **713412** (July, 2019). doi: [10.1101/713412](https://doi.org/10.1101/713412)
+# Load packages {-}
+
+```{r load-libs, message = FALSE,  warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(limma)
+library(muscat)
+library(purrr)
+```
+
+# Introduction
+
+## What is DS analysis?
+
+A fundamental task in the analysis of single-cell RNA-sequencing (scRNA-seq) data is the identification of systematic transcriptional changes [@Stegle2015]. Such analyses are a critical step in the understanding of molecular responses, and have applications in development, in perturbation studies or in disease.  
+Most of the current scRNA-seq differential expression (DE) analysis methods are designed to test one set of cells against another (or more generally, multiple sets together), and can be used to compare cell clusters (e.g., for identifying marker genes) or across conditions (cells from one condition versus another) [@Soneson2018]. In such statistical models, the cells are the experimental units and thus represent the population that inferences will extrapolate to.
+
+Using established terminology, we refer to cell *identity* as the combination of cell *type*, a stable molecular signature, and cell *state*, a transient snapshot of a cell's molecular events [@Wagner2016; @Trapnell2015]. This classification is inherently arbitrary, but still provides a basis for biological interpretation and a framework for discovering interesting expression patterns from scRNA-seq datasets. For example, T cells could be defined as a single (albeit diverse) cell type or could be divided into discrete subtypes, if relevant information to categorize each cell at this level were available. In either case, the framework presented here would be able to focus on the cell type of interest and look for changes (in expression) across samples.  
+Given the emergence of multi-sample multi-group scRNA-seq datasets, the goal becomes making sample-level inferences (i.e., experimental units are samples). Thus, differential state (DS) analysis is defined as following a given cell type across a set of samples (e.g., individuals) and experimental conditions (e.g., treatments), in order to identify cell-type-specific responses, i.e., changes in cell state. DS analysis: i) should be able to detect diluted changes that only affect a single cell type, a subset of cell types or even a subset of a single subpopulation; and, ii) is intended to be orthogonal to clustering or cell type assignment. 
+
+## Starting point
+
+The starting point for a DS analysis is a (sparse) matrix of gene expression, either as counts or some kind of normalized data, where rows = genes and columns = cells. Each cell additionally has a cluster (subpopulation) label as well as a sample label; metadata should accompany the list of samples, such that they can be organized into comparable groups with sample-level replicates (e.g., via a design matrix). 
+
+The approach presented here is modular and thus subpopulation labels could originate from an earlier step in the analysis, such as clustering [@Duo2018; @Freytag2018-clustering], perhaps after integration  [@Butler2018-Seurat; @Stuart2019] or after labeling of clusters [@Diaz-Mejia2019] or after cell-level type assignment [@Zhang2019].
+
+# Getting started
+
+## Data description
+
+For this vignette, we will use a `r Biocpkg("SingleCellExperiment")` (SCE) containing 10x droplet-based scRNA-seq PBCM data from 8 Lupus patients obtained befor and after 6h-treatment with IFN-$\beta$ [@Kang2018-demuxlet]. The complete raw data, as well as gene and cell metadata is available through the NCBI GEO, accession number [GSE96583](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE96583). 
+
+## Loading the data
+
+The @Kang2018-demuxlet dataset has been made available through Biocondcutor's `ExperimentHub` and can be loaded into R as follows: We first initialize a Hub instance to search for and load available data with the `ExperimentHub` function, and store the complete list of records in the variable `eh`. Using `query`, we then retrieve any records that match our keyword(s) of interest, as well as their corresponding accession ID (EH1234).
+
+```{r eh, message = FALSE}
+library(ExperimentHub)
+eh <- ExperimentHub()
+query(eh, "Kang")
+```
+
+Finally, we load the data of interest into R via `[[` and the corresponding accession ID. The dataset contains >35,000 genes and ~29,000 cells:
+
+```{r load-data, message = FALSE}
+(sce <- eh[["EH2259"]])
+```
+

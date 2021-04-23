@@ -9,9 +9,10 @@ library('mltools')
 library('leiden')
 library('ComplexHeatmap')
 library('seriation')
+library('viridis')
 
 
-nngraph_comm <- function(nngraph, min_cells = 1000){
+nngraph_comm <- function(nngraph, min_cells = 100){
     comm_vec = leiden(nngraph, resolution_parameter=0.01)
     comm_dt  = table(comm_vec)
     to.keep  = max(as.numeric(names(comm_dt)[comm_dt > min_cells]))
@@ -171,6 +172,25 @@ plot_2d <- function(dim_df, labels, label_cols=nice_cols, title='', label_title=
     dim_plot
 }
 
+plot_2d_cont <- function(dim_df, labels, label_cols=nice_cols, title='', label_title='label'){
+    dim_dt = data.table(label=labels,
+                         dim1=unlist(dim_df[,1]), dim2=unlist(dim_df[,2])) 
+    dim_plot = dim_dt %>%
+        ggplot +
+        aes(dim1, dim2, color=label) +
+        geom_hex(bins = 30) + 
+        coord_fixed() +
+        scale_fill_viridis() +
+        theme_bw() + 
+        theme(legend.position = "none",
+            axis.text= element_blank(), 
+            axis.ticks.x=element_blank(),
+            axis.ticks.y=element_blank(), 
+            panel.grid.major = element_blank(), 
+            panel.grid.minor = element_blank()) +
+        labs(title=title, x='', y='', color=label_title)
+    dim_plot
+}
 
 hm_col_act <- function(
     mtx, 

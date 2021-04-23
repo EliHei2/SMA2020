@@ -1,0 +1,266 @@
+---
+title: "Reconstructing the Spatial Dataset with `novosparc`"
+author:
+- name: Elyas Heidari
+  affiliation: 
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Switzerland
+  - Swiss Institute of Bioinformatics (SIB), University of Zurich, Switzerland
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Setup / definitions
+
+## Libraries
+
+```{r setup_knitr, include=FALSE}
+library('BiocStyle')
+library('BiocParallel')
+options(bitmapType='cairo')
+set.seed(1996)
+knitr::opts_chunk$set( autodep=TRUE, cache=FALSE, cache.lazy=FALSE, dev='png' )
+knitr::opts_knit$set( root.dir='..' )
+# wflow_build(files='analysis/sma02_novosparc.Rmd', view=F, verbose=T, delete_cache=F)
+```
+
+```{r setup_libs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+library('tidyverse')
+library('igraph')
+library('data.table')
+library('SingleCellExperiment')
+library('magrittr')
+library('BiocParallel')
+library('patchwork')
+```
+
+## Helper functions
+
+```{r setup_helpers, message=FALSE, cache=FALSE}
+source('code/sma00_utils.R')
+source('code/sma01_eda.R')
+source('code/sma02_novosparc.R')
+```
+
+## Inputs
+
+```{r setup_input}
+exprs_f    = 'data/exprs.Rds'
+metadata_f = 'data/metadata.Rds'
+umap_f     = 'data/E8.5_joint_UMAP_df.Rds'
+nngraph_f  = 'data/E8.5_neighbourGraph_1.3.Rds'
+```
+
+## Outputs
+
+```{r setup_outputs}
+#### output dirs
+input_dir   = 'data/sma02_novosparc/input'
+dir.create(input_dir)
+expr_mat_f  = file.path(input_dir, 'mtx_%s.txt')
+locations_f = file.path(input_dir, 'locs_%s.txt')
+
+output_dir   = 'data/sma02_novosparc/output'
+dir.create(output_dir)
+
+atlas     = 'embryo1_2'
+ncells    = 5000
+nns       = 5
+nnt       = 5
+alpha     = 0.8 
+epsilon   = 0.005
+seed      = 1996
+overwrite = FALSE
+bpparam   = MulticoreParam(workers=2)
+```
+
+## Load inputs
+
+```{r load_inputs}
+nngraph  = nngraph_f %>% readRDS 
+cells    = names(V(nngraph))
+exprs    = exprs_f %>% readRDS %>% 
+    as.matrix %>% .[, cells]  %>% t 
+metadata = metadata_f %>% readRDS %>% as.data.table %>%
+    setnames('uniqueID', 'cell') %>%
+    setkey('cell') %>%
+    .[cells] %>%
+    .[, embryo := paste(embryo, z, sep='_')]
+embryos       = unique(metadata$embryo)
+cells_list   = embryos %>%
+    map(~unlist(metadata[embryo == .x, 'cell'])) %>%
+    setNames(embryos)
+nngraph_list = cells_list %>% 
+    map(~induced.subgraph(nngraph, .x))
+mtx_list   = cells_list %>% 
+    map(~exprs[.x, ]) %>%
+    map(t) 
+# nncomm_list  = nngraph_list %>% 
+#     map(nngraph_comm) %>%
+#     setNames(NULL) %>%
+#     unlist
+# metadata$nncomm = paste(metadata$embryo, nncomm_list[metadata$cell], sep='_')
+metadata %<>% 
+    .[, .(cell, x_coord=x_global_affine, y_coord=y_global_affine, celltype_mapped_refined)] %>%
+    DataFrame 
+rownames(metadata) = metadata$cell
+meta_list    = cells_list %>%
+    map(~metadata[.x, ]) 
+```
+
+## Save `novosparc` input
+```{r novo_input, message=FALSE, warning=FALSE, paged.print=FALSE, eval=FALSE}
+exprs_list = mtx_list %>%
+    map(as.data.table, keep.rownames=T) %>%
+    map(~setnames(.x, 'rn', ''))
+locs_list    = cells_list %>%
+    map(~metadata[.x, c('x_coord', 'y_coord')])
+names(cells_list) %>% map(~fwrite(exprs_list[[.x]], sprintf(expr_mat_f, .x)), row.names = TRUE)
+names(cells_list) %>% map(~fwrite(locs_list[[.x]], sprintf(locations_f, .x)), row.names = TRUE)
+```
+
+# Processing / calculations
+
+## `novosparc` on complete datasets
+```{r ns_calc_all, message=FALSE, warning=FALSE, paged.print=FALSE, results='hide', eval=FALSE}
+
+bplapply(
+    X = names(cells_list),
+    FUN = function(x) run_novosparc(
+        input_dir    = input_dir, 
+        output_dir   = output_dir, 
+        tag          = tags[[x]], 
+        atlas_locs_f = sprintf('locs_%s.txt', atlas), 
+        atlas_mtx_f  = sprintf('mtx_%s.txt', atlas), 
+        expr_mtx_f   = sprintf('mtx_%s.txt', x),
+        ncells       = ncells, 
+        nns          = nns, 
+        nnt          = nnt, 
+        alpha        = alpha, 
+        epsilon      = epsilon, 
+        seed         = seed,
+        overwrite    = overwrite
+    ), 
+   BPPARAM = bpparam)
+```
+
+```{r ns_calc_all_results, message=FALSE, warning=FALSE, paged.print=FALSE, results='hide', cache=FALSE}
+tags = names(cells_list) %>% map(~paste(.x, atlas, sep='_'))
+names(tags) = names(cells_list)
+sce_list = names(cells_list) %>%
+    map(~SingleCellExperiment(
+            assays   = list('counts_real' = mtx_list[[.x]]),
+            colData  = meta_list[[.x]]
+        )
+    ) 
+names(sce_list) = names(cells_list) 
+sce_ref  = sce_list[[atlas]] 
+assays(sce_ref)[['counts_real']] %<>%
+        apply(2, function(x) (x)/(mean(x))) 
+sce_list = names(tags) %>% 
+    map(~ns2sce(
+            dir        = file.path(output_dir, tags[[.x]]), 
+            sce_origin = sce_list[[.x]],
+            sce_ref    = sce_ref,
+            tag        = .x
+        )
+    )
+names(sce_list) = names(tags)
+```
+
+# Analysis
+
+## Reconstructed space {.tabset}
+```{r sp_plots, fig.height=10, fig.width=12, results='asis', cache=FALSE, warning=FALSE}
+for(t in sort(names(sce_list))){
+    col_dt = colData(sce_list[[t]]) %>% as.data.table
+    meta   = metadata(sce_list[[t]])
+    row_dt = rowData(sce_list[[t]]) %>% as.data.table
+    cat('### ', t, '\n')
+        type_p = plot_2d(
+            dim_df = col_dt[, .(x_coord, -y_coord)],
+            labels = col_dt$celltype_mapped_refined,
+            label_cols = celltype_colours,
+            label_title  = 'Cell type',
+            title = sprintf('ARI = %s', meta$ari)
+        )
+        comm_p = plot_2d(
+            dim_df = col_dt[, .(x_coord, -y_coord)],
+            labels = as.factor(col_dt$nncomm_real),
+            label_title = 'Spatial neighborhood',
+            title = sprintf('MSE = %s', meta$MSE)
+        )     
+
+        type_p_pred = plot_2d(
+            dim_df = col_dt[, .(x_pred, -y_pred)],
+            labels = col_dt$celltype_mapped_refined,
+            label_cols = celltype_colours,
+            label_title  = 'Cell type'
+        )
+        comm_p_pred = plot_2d(
+            dim_df = col_dt[, .(x_pred, -y_pred)],
+            labels = as.factor(col_dt$nncomm_real),
+            label_title = 'Spatial neighborhood'
+        )    
+
+        trend_p = row_dt %>%
+            ggplot +
+            aes(x = mI, y = MSE) +
+            geom_point() +
+            geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), se = FALSE)
+            theme_bw() + 
+            theme(axis.text= element_blank(), 
+                axis.ticks.x=element_blank(),
+                axis.ticks.y=element_blank(), 
+                panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank()
+            )
+
+        # mse_p = plot_2d_cont(
+        #     dim_df = col_dt[, .(x_coord, -y_coord)],
+        #     labels = colData(sce_ref)[, paste0(t, '_MSE')],
+        #     label_title = 'MSE'
+        # ) 
+        pl = (type_p + comm_p + type_p_pred + comm_p_pred + trend_p) + plot_layout(guides = 'collect', ncol=2)
+        print(pl)
+    cat('\n\n')
+
+}
+
+```
+
+##
+
+
+## Expression predections
+```{r expr_pred_pl, fig.height=12, fig.width=15, message=FALSE, warning=FALSE, paged.print=FALSE}
+col_dt = colData(sce_ref) %>% as.data.table
+meta   = metadata(sce_ref)
+
+pl = sort(names(sce_list)) %>%
+    map(~plot_2d_cont(
+            dim_df = col_dt[, .(x_coord, -y_coord)],
+            labels = colData(sce_ref)[, paste0(.x, '_MSE')],
+            label_title = 'MSE',
+            title = sprintf('%s, MSE = %s', .x,metadata(sce_list[[.x]])$MSE)
+        )
+    ) %>%
+    purrr::reduce(`+`)
+pl = (pl) + 
+    plot_layout(guides = 'collect', ncol=2)
+print(pl)
+```
+
+
+# Outputs
+
+```{r save_outputs}
+```
+
+```{r session_info, include=TRUE, echo=TRUE, results='markup'}
+devtools::session_info()
+```

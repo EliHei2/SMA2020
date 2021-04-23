@@ -42,7 +42,14 @@ exprs_list   = cells_list %>%
 metadata %>% setkey('cell')
 locs_list    = cells_list %>%
     map(~metadata[.x, .(x_coord=x_global_affine, y_coord=y_global_affine)])
-
+nncomm_list  = nngraph_list %>% 
+    map(nngraph_comm) %>%
+    setNames(NULL) %>%
+    unlist
+metadata$nncomm = paste(metadata$embryo, nncomm_list[metadata$cell], sep='_') 
+meta_list    = cells_list %>%
+    map(~metadata[cell %in% .x, ])
+    
 ### save output
 names(cells_list) %>% map(~fwrite(exprs_list[[.x]], sprintf(expr_mat_f, .x)), row.names = TRUE)
 names(cells_list) %>% map(~fwrite(locs_list[[.x]], sprintf(locations_f, .x)), row.names = TRUE)
