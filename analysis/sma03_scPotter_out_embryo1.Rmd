@@ -1,0 +1,276 @@
+---
+title: "Mapping Cells to Space Using scPotter"
+author:
+- name: Elyas Heidari
+  affiliation: 
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Switzerland
+  - Swiss Institute of Bioinformatics (SIB), University of Zurich, Switzerland
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Setup / definitions
+
+## Libraries
+
+```{r setup_knitr, include=FALSE}
+library('BiocStyle')
+options(bitmapType='cairo')
+set.seed(1996)
+knitr::opts_chunk$set( autodep=TRUE, cache=FALSE, cache.lazy=FALSE, dev='png' )
+knitr::opts_knit$set( root.dir='..' )
+# wflow_build(files='analysis/sma03_scPotter_out_embryo1.Rmd', view=F, verbose=T, delete_cache=T)
+```
+
+```{r setup_libs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+library('pika')
+library('tidyverse')
+library('igraph')
+library('data.table')
+library('SingleCellExperiment')
+library('magrittr')
+library('BiocParallel')
+library('patchwork')
+library('limma')
+```
+
+## Helper functions
+
+```{r setup_helpers, message=FALSE, cache=FALSE}
+source('code/sma00_utils.R')
+source('code/sma01_eda.R')
+source('code/sma02_novosparc.R')
+source('code/sma03_scPotter.R')
+```
+
+## Inputs
+
+```{r setup_input}
+metadata_f      = 'data/metadata.Rds'
+data_dir        = 'data/sma03_scPotter/pred/embryo1_5'
+out_dir         = 'output/sma03_scPotter/embryo1_5'
+ref_classes_f   = file.path(data_dir, 'classes_train.txt')
+query_classes_f = file.path(data_dir, 'classes_test.txt')
+ref_data_f   = file.path(data_dir, 'data_train.txt')
+query_data_f = file.path(data_dir, 'data_test.txt')
+imp_f           = file.path(out_dir, 'imp.txt')
+preds_f         = file.path(out_dir, 'preds.txt')
+##
+```
+
+## Outputs
+
+```{r setup_outputs}
+```
+
+## Params
+
+```{r setup_params}
+
+```
+
+# Load inputs
+
+```{r load_inputs}
+metadata = metadata_f %>% readRDS %>% as.data.table %>%
+    setnames('uniqueID', 'cell') %>%
+    setkey('cell') %>%
+    .[, embryo := paste(embryo, z, sep='_')] %>%
+    setkey('cell')
+ref_classes = ref_classes_f %>% fread %>% setnames('cell_id', 'cell')
+query_classes = query_classes_f %>% fread %>% setnames('cell_id', 'cell')
+imp = imp_f %>% fread %>% setnames('V1', 'GENE')
+genes = imp$GENE
+imp %<>% .[,-1] %>% as.matrix
+rownames(imp) = genes
+preds = preds_f %>% fread %>% .[,-1] %>% as.matrix
+rownames(preds) = query_classes$cell
+pred_classes = apply(preds, 1, function(x) colnames(preds)[which.max(x)])
+meta_list = list()
+meta_list$ref   = metadata[ref_classes, on='cell']
+meta_list$query = metadata[query_classes, on='cell'] %>%
+    .[, pred := ..pred_classes[cell]]
+ref_data   = ref_data_f %>% fread %>% as.matrix %>% .[, meta_list$ref$cell]
+query_data = query_data_f %>% fread %>% as.matrix %>% .[, meta_list$query$cell]
+rownames(ref_data) = rownames(query_data) = genes
+```
+
+# Processing / calculations
+
+
+## Spatially informative genes
+
+```{r inf_genes, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+imp_abs = abs(imp)
+imp_dt = apply(imp_abs, 2, function(x) rownames(imp)[rank(x)[1:10]]) %>%
+    as.data.table
+DT::datatable(imp_dt)
+imp_dt %<>% .[1:8,]
+```
+
+## UMAPs based on scPotter's last layer
+
+```{r umaps_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+# preds = exp(preds)
+umap_preds = uwot::umap(preds)
+# umap_preds = tsne_preds$Y
+rownames(umap_preds) = rownames(preds)
+meta_list$query[, `:=`(pred_umap1 = ..umap_preds[cell, 1], 
+                        pred_umap2 = ..umap_preds[cell, 2])]
+```
+
+# Analysis
+
+## Spatial predictions{.tabset}
+```{r sp_plots, fig.height=8, fig.width=12, results='asis', cache=FALSE}
+type_ref_p = plot_2d(
+    dim_df = meta_list$ref[, .(x_global_affine, -y_global_affine)],
+    labels = meta_list$ref$celltype_mapped_refined,
+    label_cols = celltype_colours,
+    label_title  = 'Cell type',
+    title = 'reference'
+)
+class_ref_p = plot_2d(
+    dim_df = meta_list$ref[, .(x_global_affine, -y_global_affine)],
+    labels = meta_list$ref$class_,
+    label_title = 'Spatial neighborhood'
+) 
+
+type_query_p = plot_2d(
+    dim_df = meta_list$query[, .(x_global_affine, -y_global_affine)],
+    labels = meta_list$query$celltype_mapped_refined,
+    label_cols = celltype_colours,
+    label_title  = 'Cell type',
+    title = 'query'
+)
+class_query_p = plot_2d(
+    dim_df = meta_list$query[, .(x_global_affine, -y_global_affine)],
+    labels = meta_list$query$pred,
+    label_title = 'Spatial neighborhood'
+)     
+
+pl = (type_ref_p + class_ref_p + type_query_p + class_query_p) + plot_layout(guides = 'collect', nrow=2)
+print(pl)
+```
+
+## Spatially informative genes{.tabset}
+```{r inf_genes_plots, fig.height=20, fig.width=8, results='asis', cache=FALSE}
+for(t in colnames(imp_dt)){
+    plots = list()
+    meta_ref = copy(meta_list$ref) %>% .[, class_ := ifelse(class_ == t, t, NA)]
+    meta_query = copy(meta_list$query) %>% .[, pred := ifelse(pred == t, t, NA)]
+    plots[['ref']] = plot_2d(
+        dim_df = meta_ref[, .(x_global_affine, -y_global_affine)],
+        labels = meta_ref$class_,
+        hide_legend = TRUE,
+        title = 'reference'
+    ) 
+
+    plots[['query']] = plot_2d(
+        dim_df = meta_query[, .(x_global_affine, -y_global_affine)],
+        labels = meta_query$pred,
+        hide_legend = TRUE,
+        title = 'query (predictions)'
+    )   
+
+    expr_vals = imp_dt[[t]] %>% 
+        map(~ref_data[.x,]) %>%
+        map(unlist)
+    names(expr_vals) = imp_dt[[t]]
+
+    expr_plots = imp_dt[[t]] %>%
+        map(~plot_2d_cont(
+                dim_df = meta_ref[, .(x_global_affine, -y_global_affine)],
+                labels = expr_vals[[.x]],
+                title = .x
+            )
+        )
+
+    plots = append(plots, expr_plots) %>% purrr::reduce(`+`)
+
+
+    cat('### ', t, '\n')
+        plots = (plots) + 
+            plot_layout(guides = 'collect', ncol=2)
+        print(plots)
+    cat('\n\n')
+}
+```
+
+## UMAPs based on scPotter's last layer
+
+```{r umaps_plots, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, fig.height=12, fig.width=8}
+class_p = plot_2d(
+    dim_df = meta_list$query[, .(x_global_affine, -y_global_affine)],
+    labels = meta_list$query$celltype_mapped_refined,
+    label_cols = celltype_colours,
+    hide_legend = TRUE,
+    title = 'cell type'
+) 
+
+pred_p = plot_2d(
+    dim_df = meta_list$query[, .(x_global_affine, -y_global_affine)],
+    labels = meta_list$query$pred,
+    label_cols = nice_cols,
+    hide_legend = TRUE,
+    title = 'prediction'    
+) 
+
+class_umap_p = plot_2d(
+    dim_df = meta_list$query[, .(UMAP1, UMAP2)],
+    labels = meta_list$query$celltype_mapped_refined,
+    label_cols = celltype_colours,
+    hide_legend = TRUE
+) 
+
+pred_umap_p = plot_2d(
+    dim_df = meta_list$query[, .(UMAP1, UMAP2)],
+    labels = meta_list$query$pred,
+    label_cols = nice_cols,
+    hide_legend = TRUE
+) 
+
+class_umap_pred_p = plot_2d(
+    dim_df = meta_list$query[, .(pred_umap1, pred_umap2)],
+    labels = meta_list$query$celltype_mapped_refined,
+    label_cols = celltype_colours,
+    hide_legend = TRUE
+) 
+
+pred_umap_pred_p = plot_2d(
+    dim_df = meta_list$query[, .(pred_umap1, pred_umap2)],
+    labels = meta_list$query$pred,
+    label_cols = nice_cols,
+    hide_legend = TRUE
+) 
+ 
+
+pl = (
+        class_p +
+        pred_p +
+        class_umap_p +
+        pred_umap_p +
+        class_umap_pred_p +
+        pred_umap_pred_p
+    ) + 
+    plot_layout(guides = 'collect', ncol=2)
+print(pl)
+```
+
+
+
+# Outputs
+
+```{r save_outputs}
+
+```
+
+```{r session_info, include=TRUE, echo=TRUE, results='markup'}
+devtools::session_info()
+```
+

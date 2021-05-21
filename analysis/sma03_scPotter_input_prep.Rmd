@@ -1,0 +1,244 @@
+---
+title: "Exploring the Spatial Mouse Atlas"
+author:
+- name: Elyas Heidari
+  affiliation: 
+  - &IMLS Institute for Molecular Life Sciences, University of Zurich, Switzerland
+  - Swiss Institute of Bioinformatics (SIB), University of Zurich, Switzerland
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+# Setup / definitions
+
+## Libraries
+
+```{r setup_knitr, include=FALSE}
+library('BiocStyle')
+options(bitmapType='cairo')
+set.seed(1996)
+knitr::opts_chunk$set( autodep=TRUE, cache=FALSE, cache.lazy=FALSE, dev='png' )
+knitr::opts_knit$set( root.dir='..' )
+# wflow_build(files='analysis/sma03_scPotter_input_prep.Rmd', view=F, verbose=T, delete_cache=T)
+```
+
+```{r setup_libs, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+library('pika')
+library('tidyverse')
+library('igraph')
+library('data.table')
+library('SingleCellExperiment')
+library('magrittr')
+library('BiocParallel')
+library('patchwork')
+library('limma')
+```
+
+## Helper functions
+
+```{r setup_helpers, message=FALSE, cache=FALSE}
+source('code/sma00_utils.R')
+source('code/sma01_eda.R')
+source('code/sma02_novosparc.R')
+source('code/sma03_scPotter.R')
+```
+
+## Inputs
+
+```{r setup_input}
+exprs_f    = 'data/exprs.Rds'
+metadata_f = 'data/metadata.Rds'
+umap_f     = 'data/E8.5_joint_UMAP_df.Rds'
+nngraph_f  = 'data/E8.5_neighbourGraph_1.3.Rds'
+```
+
+## Outputs
+
+```{r setup_outputs}
+out_dir    = 'data/sma03_scPotter'
+dir.create(out_dir)
+train_dir  = file.path(out_dir, 'train')
+dir.create(train_dir)
+pred_dir   = file.path(out_dir, 'pred')
+dir.create(pred_dir)
+train_path = sprintf('%s/train/%s', out_dir, '%s')
+pred_path  = sprintf('%s/pred/%s', out_dir, '%s')
+# tags       = list()
+# tags[['adj']]    = 'adj.txt'
+# tags[['names']]  = 'feature_names.txt'
+# tags[['data_train']]  = 'data_train.txt'
+# tags[['data_test']]   = 'data_test.txt'
+# tags[['class_train']] = 'classes_train.txt'
+# tags[['class_test']]  = 'classes_test.txt'
+# train_tags = tags %>% map(~file.path(train_path, .x))
+# pred_tags  = tags %>% map(~file.path(pred_path, .x))
+```
+
+## Params
+
+```{r setup_params}
+train_sec  = 2
+pred_sec   = 5
+train_prop = 0.9
+rho        = 0.2
+threshold  = 0.02
+min_cells  = 10
+res_param  = 1
+```
+
+# Load inputs
+
+```{r load_inputs}
+nngraph  = nngraph_f %>% readRDS 
+cells    = names(V(nngraph))
+metadata = metadata_f %>% readRDS %>% as.data.table %>%
+    setnames('uniqueID', 'cell') %>%
+    setkey('cell') %>%
+    .[cells] %>%
+    .[, embryo := paste(embryo, z, sep='_')]
+embryos       = unique(metadata$embryo)
+cells_list   = embryos %>%
+    map(~unlist(metadata[embryo == .x, 'cell'])) %>%
+    setNames(embryos)
+nngraph_list = cells_list %>% 
+    map(~induced.subgraph(nngraph, .x))
+```
+
+# Processing / calculations
+
+## Spatial graph communities
+```{r spgraph_comm, message=FALSE, warning=FALSE, paged.print=FALSE}
+nncomm_list  = nngraph_list %>% 
+    map(nngraph_comm) %>%
+    setNames(NULL) %>%
+    unlist
+metadata$nncomm = nncomm_list[metadata$cell]
+to.rm = metadata[is.na(nncomm)]$cell
+metadata %<>% .[!(cell %in% to.rm)]
+metadata$nncomm = paste(metadata$embryo, nncomm_list[metadata$cell], sep='_')
+nngraph = delete.vertices(nngraph, to.rm)
+cells    = names(V(nngraph))
+cells_list   = embryos %>%
+    map(~unlist(metadata[embryo == .x, 'cell'])) %>%
+    setNames(embryos)
+nngraph_list = cells_list %>% 
+    map(~induced.subgraph(nngraph, .x))
+exprs    = exprs_f %>% readRDS %>% 
+    as.matrix %>% .[, cells]  %>% t 
+exprs_list   = cells_list %>% 
+    map(~exprs[.x, ])
+meta_list    = cells_list %>%
+    map(~metadata[cell %in% .x, ]) 
+```
+
+## GGM on everything
+
+```{r ggm_all_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graph_all = counts2graph(
+    mtx       = exprs,
+    rho       = rho,
+    threshold = threshold,
+    no_hvg    = TRUE
+)
+adj = as_adj(graph_all$graph)
+genes = colnames(adj)
+exprs = exprs[,genes]
+gc()
+```
+
+## Prepare train data
+
+```{r train_data, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+train_embryos = copy(metadata) %>%
+    .[z == train_sec] %>%
+    .$embryo %>%
+    unique
+names(train_embryos) = train_embryos
+
+train_splits = cells_list[train_embryos] %>%
+    map(split_cells, train_prop)
+
+train_exprs  = train_splits %>%
+    map(~list(train=exprs[.x$train,], test=exprs[.x$test,]))
+
+out_meta = copy(metadata) %>%
+    .[, .(cell_id = cell, class_=nncomm)] %>%
+    setkey(cell_id)
+train_meta   = train_splits %>%
+    map(~list(train=out_meta[.x$train], test=out_meta[.x$test]))
+```
+
+## Prepare prediction data
+```{r pred_data, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+pred_embryos = copy(metadata) %>%
+    .[z == pred_sec] %>%
+    .$embryo %>%
+    unique
+names(pred_embryos) = train_embryos
+
+train_cells = cells_list[train_embryos] 
+pred_cells  = cells_list[pred_embryos]
+names(pred_cells) = train_embryos
+
+pred_exprs  = train_embryos %>%
+    map(~list(train=exprs[train_cells[[.x]],], test=exprs[pred_cells[[.x]],]))
+
+pred_meta   = train_embryos %>%
+    map(~list(train=out_meta[train_cells[[.x]]], test=out_meta[pred_cells[[.x]]]))
+```
+
+
+# Outputs
+
+## Train datasets
+```{r save_train, message=FALSE, warning=FALSE, paged.print=FALSE}
+# create dirs
+train_dirs = train_embryos %>% 
+    map(~sprintf(train_path, .x)) 
+train_dirs %>% map(dir.create)
+# set file neames
+train_embryos %>%
+    map(~save_exp(
+        root_path     = train_dirs[[.x]],
+        adj           = adj,
+        data_train    = train_exprs[[.x]]$train,
+        data_test     = train_exprs[[.x]]$test,
+        classes_train = train_meta[[.x]]$train,
+        classes_test  = train_meta[[.x]]$test,
+        feature_names = genes
+    )
+)
+```
+
+```{r save_pred, message=FALSE, warning=FALSE, paged.print=FALSE}
+# create dirs
+pred_dirs = pred_embryos %>% 
+    map(~sprintf(pred_path, .x)) 
+pred_dirs %>% map(dir.create)
+# set file neames
+train_embryos %>%
+    map(~save_exp(
+        root_path     = pred_dirs[[.x]],
+        adj           = adj,
+        data_train    = pred_exprs[[.x]]$train,
+        data_test     = pred_exprs[[.x]]$test,
+        classes_train = pred_meta[[.x]]$train,
+        classes_test  = pred_meta[[.x]]$test,
+        feature_names = genes
+    )
+)
+```
+```{r save_outputs}
+
+```
+
+```{r session_info, include=TRUE, echo=TRUE, results='markup'}
+devtools::session_info()
+```
+

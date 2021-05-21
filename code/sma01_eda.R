@@ -12,8 +12,8 @@ library('seriation')
 library('viridis')
 
 
-nngraph_comm <- function(nngraph, min_cells = 100){
-    comm_vec = leiden(nngraph, resolution_parameter=0.01)
+nngraph_comm <- function(nngraph, min_cells = 100, res_param=0.1){
+    comm_vec = leiden(nngraph, resolution_parameter=res_param)
     comm_dt  = table(comm_vec)
     to.keep  = max(as.numeric(names(comm_dt)[comm_dt > min_cells]))
     comm_vec = ifelse(comm_vec <= to.keep, comm_vec, NA)
@@ -154,7 +154,7 @@ graph_col_act <- function(graph, grp, lay, title){
     p
 }
 
-plot_2d <- function(dim_df, labels, label_cols=nice_cols, title='', label_title='label'){
+plot_2d <- function(dim_df, labels, label_cols=nice_cols, title='', label_title='label', hide_legend=FALSE){
     dim_dt = data.table(label=labels,
                          dim1=unlist(dim_df[,1]), dim2=unlist(dim_df[,2])) 
     dim_plot = dim_dt %>%
@@ -167,8 +167,10 @@ plot_2d <- function(dim_df, labels, label_cols=nice_cols, title='', label_title=
             axis.ticks.y=element_blank(), 
             panel.grid.major = element_blank(), 
             panel.grid.minor = element_blank()) +
-        scale_color_manual(values=label_cols) +
+        scale_color_manual(values=label_cols, na.value='gray') +
         labs(title=title, x='', y='', color=label_title)
+    if(hide_legend)
+        dim_plot = dim_plot + theme(legend.position='none')
     dim_plot
 }
 
@@ -178,9 +180,10 @@ plot_2d_cont <- function(dim_df, labels, label_cols=nice_cols, title='', label_t
     dim_plot = dim_dt %>%
         ggplot +
         aes(dim1, dim2, color=label) +
-        geom_hex(bins = 30) + 
-        coord_fixed() +
-        scale_fill_viridis() +
+        # geom_hex(bins = 30) + 
+        geom_point(size=0.5) +
+        # coord_fixed() +
+        scale_color_viridis() +
         theme_bw() + 
         theme(legend.position = "none",
             axis.text= element_blank(), 

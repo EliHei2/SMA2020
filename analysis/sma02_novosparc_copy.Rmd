@@ -37,6 +37,7 @@ library('SingleCellExperiment')
 library('magrittr')
 library('BiocParallel')
 library('patchwork')
+library('limma')
 ```
 
 ## Helper functions
@@ -174,7 +175,45 @@ names(sce_list) = names(tags)
 ```
 
 
+## GGM on everything
 
+```{r ggm_all_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graph_all = counts2graph(
+    mtx       = t(assays(sce_ref)[['counts_real']]),
+    rho       = 0.15,
+    threshold = 0.015,
+    no_hvg    = TRUE
+)
+gc()
+```
+
+## GGM on embryo sections 
+```{r ggm_embryo_calc, collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+#TODO: optimize rho and threshold
+graphs_pred = list()
+ari_pred = list()
+for(t in sort(names(sce_list))){
+    log_counts_type = t(assays(sce_ref)[[paste0('counts_', t)]]) 
+    if(sum(colSds(log_counts_type) == 0) > 0)
+        log_counts_type %<>% .[, -which(colSds(.) == 0)]
+    log_counts_type %<>% as.data.table
+    ggm_obj = ggm(log_counts_type, rho=0.2, threshold=0.02)
+    gg = ggm_obj$graph
+    wi = ggm_obj$model$wi
+    isolated  = which(igraph::degree(gg) == 0)
+    gg = delete.vertices(gg, isolated)
+    wi %<>% .[-isolated, -isolated]
+    ggm_obj$graph    = gg
+    ggm_obj$model$wi = wi
+    graphs_pred[[t]] = ggm_obj
+    comms  = leiden(abs(wi) > 0.02)
+    comm_dt  = copy(graph_all$comm_dt) %>% setkey('GENE')
+    ref_comm = comm_dt[names(V(gg))]$community
+    ari_pred[[t]] = mclust::adjustedRandIndex(ref_comm, comms)
+}
+gc()
+```
 # Analysis
 
 ## Reconstructed space {.tabset}
@@ -258,9 +297,36 @@ pl = (pl) +
 print(pl)
 ```
 
+## GGM on everything 
+```{r ggm_all_graph, fig.height=11, fig.width=11 , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+graph_col_comm(
+    graph  = graph_all$graph, 
+    lay    = graph_all$lay, 
+    grp    = graph_all$comm_dt$color, 
+    sz     = 5, 
+    title  = 'GGM on everything', 
+    labels = graph_all$comm_dt$GENE
+)
+```
 
 
+### GGM on embryo sections {.tabset}
+```{r ggm_embryo_rob_graph, fig.height=11, fig.width=11, results='asis' , collapse=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+comm_dt = copy(graph_all$comm_dt) %>% setkey(GENE)
+for(t in sort(names(sce_list))){
+    cat('#### ', t, '\n')
+        gg = graph_col_comm(
+            graph  = graphs_pred[[t]]$graph, 
+            lay    = layout_nicely(graphs_pred[[t]]$graph), 
+            grp    = comm_dt[names(V(graphs_pred[[t]]$graph))]$color, 
+            sz     = 5, 
+            title  = sprintf('GGM on %s, ARI = %s', t, ari_pred[[t]]), 
+            labels = comm_dt[names(V(graphs_pred[[t]]$graph))]$GENE
+        )
+    cat('\n\n')
 
+}
+```
 
 # Outputs
 
